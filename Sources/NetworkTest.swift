@@ -27,7 +27,7 @@ final class NetworkManager: ObservableObject {
         newTask.resume()
         status = "connessione a \(trimmed):\(port)…"
         send(["type": "handshake", "device": "iPhone"])
-        receive()
+        receive(on: newTask)
     }
 
     func disconnect() {
@@ -45,27 +45,37 @@ final class NetworkManager: ObservableObject {
             status = "JSON non valido"; return
         }
         task?.send(.string(str)) { [weak self] err in
-            if let err = err { self?.status = "invio fallito: \(err.localizedDescription)" }
+            guard let err = err else { return }
+            DispatchQueue.main.async {
+                self?.status = "invio fallito: \(err.localizedDescription)"
+            }
         }
     }
 
-    private func receive() {
-        task?.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .failure(let err):
-                self.status = "disconnesso: \(err.localizedDescription)"
-                self.currentPatch = "-"
-                self.blackoutHandler?(false)
-            case .success(let msg):
-                var text = ""
-                switch msg {
-                case .string(let s): text = s
-                case .data(let d): text = String(data: d, encoding: .utf8) ?? ""
+    // Le callback di URLSessionWebSocketTask arrivano su un thread in background.
+    // Tutto il resto (stato SwiftUI, luminosità, feedback aptico) deve girare sul main thread.
+    private func receive(on socket: URLSessionWebSocketTask) {
+        socket.receive { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                // Ignora i messaggi di un socket vecchio (es. dopo Stop o un secondo Connetti)
+                guard self.task === socket else { return }
+                switch result {
+                case .failure(let err):
+                    self.status = "disconnesso: \(err.localizedDescription)"
+                    self.currentPatch = "-"
+                    self.blackoutHandler?(false)
+                case .success(let msg):
+                    var text = ""
+                    switch msg {
+                    case .string(let s): text = s
+                    case .data(let d): text = String(data: d, encoding: .utf8) ?? ""
+                    @unknown default: break
+                    }
+                    self.lastMessage = text
+                    self.handle(text: text)
+                    self.receive(on: socket)
                 }
-                self.lastMessage = text
-                self.handle(text: text)
-                self.receive()
             }
         }
     }
@@ -122,16 +132,22 @@ final class NetworkManager: ObservableObject {
 
     private func startSampling(patchId: String, frames: Int, intervalMs: Double) {
         var samples: [[Double]] = []
+        var attempts = 0
         func step() {
+            attempts += 1
             if let s = self.sampleProvider?(), s.count >= 3 { samples.append(s) }
-            if samples.count < frames {
+            if samples.count < frames && attempts < frames * 5 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + intervalMs / 1000.0, execute: step)
             } else {
-                let n = Double(samples.count)
-                var sum = [0.0, 0.0, 0.0]
-                for s in samples { sum[0] += s[0]; sum[1] += s[1]; sum[2] += s[2] }
-                let avg = sum.map { $0 / n }
-                let sigma = samples.last?.count ?? 0 > 3 ? samples[frames - 1][3] : -1.0
+                var avg = [0.0, 0.0, 0.0]
+                var sigma = -1.0
+                if !samples.isEmpty {
+                    let n = Double(samples.count)
+                    var sum = [0.0, 0.0, 0.0]
+                    for s in samples { sum[0] += s[0]; sum[1] += s[1]; sum[2] += s[2] }
+                    avg = sum.map { $0 / n }
+                    if let last = samples.last, last.count > 3 { sigma = last[3] }
+                }
                 self.send(["type": "reading", "patch_id": patchId,
                            "raw_data": avg, "sigma": sigma, "frames": samples.count])
                 self.status = "misurato \(patchId)"

@@ -184,13 +184,16 @@ struct ContentView: View {
                 cam?.lockAllAtCurrent()
                 cam?.setNeutralGains()
             }
+            // Chiamato sempre sul main thread da NetworkManager
             net.blackoutHandler = { [weak cam] on in
-                cam?.blackout = on
+                guard let cam = cam else { return }
                 if on {
-                    savedBrightness = UIScreen.main.brightness
+                    if !cam.blackout { savedBrightness = UIScreen.main.brightness }
+                    cam.blackout = true
                     UIScreen.main.brightness = 0.02
                 } else {
-                    UIScreen.main.brightness = savedBrightness
+                    if cam.blackout { UIScreen.main.brightness = savedBrightness }
+                    cam.blackout = false
                 }
             }
             net.finishHandler = { [weak cam] in
