@@ -204,6 +204,41 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
+    /// Setup fisso per la calibrazione: ISO e otturatore manuali, gain del bianco 1/1/1, fuoco bloccato.
+    /// Tutto in un'unica lockForConfiguration, indipendente dalla luminosità della scena
+    /// (a differenza di lockAllAtCurrent, che congela ciò che l'auto-esposizione ha scelto).
+    func applyFixedCalibration(iso: Float, shutter: Double) {
+        withDevice { d in
+            let f = d.activeFormat
+            var report = [String]()
+
+            if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
+
+            if d.isExposureModeSupported(.custom) {
+                let i = min(max(iso, f.minISO), f.maxISO)
+                let lo = f.minExposureDuration.seconds
+                let hi = f.maxExposureDuration.seconds
+                let t = CMTime(seconds: min(max(shutter, lo), hi), preferredTimescale: 1_000_000)
+                d.setExposureModeCustom(duration: t, iso: i, completionHandler: nil)
+                report.append("ISO \(Int(i)), \(self.fmt(t.seconds, 5)) s")
+            } else if d.isExposureModeSupported(.locked) {
+                d.exposureMode = .locked
+                report.append("esposizione manuale non supportata: bloccata al valore attuale")
+            }
+
+            if d.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                let gains = AVCaptureDevice.WhiteBalanceGains(redGain: 1.0, greenGain: 1.0, blueGain: 1.0)
+                d.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+                report.append("WB 1/1/1")
+            } else if d.isWhiteBalanceModeSupported(.locked) {
+                d.whiteBalanceMode = .locked
+                report.append("gain personalizzati non supportati: WB bloccato al valore attuale")
+            }
+
+            self.setStatus("Calibrazione fissa: " + report.joined(separator: ", "))
+        }
+    }
+
     func setCustomExposure(iso: Float, shutter: Double) {
         withDevice { d in
             guard d.isExposureModeSupported(.custom) else {

@@ -18,6 +18,10 @@ struct ContentView: View {
                                 "Grigio 50%", "Grigio 60%", "Grigio 70%", "Grigio 80%", "Grigio 90%",
                                 "Bianco", "Rosso", "Verde", "Blu", "Ciano", "Magenta", "Giallo"]
 
+    // Esposizione fissa usata durante la calibrazione (ISO viene limitato al minimo supportato dalla camera)
+    private static let calibrationISO: Float = 20
+    private static let calibrationShutter: Double = 1.0 / 250
+
     private static func next(after text: String) -> String {
         let t = text.trimmingCharacters(in: .whitespaces).lowercased()
         for i in 0..<(order.count - 1) where order[i].lowercased() == t {
@@ -181,8 +185,7 @@ struct ContentView: View {
             }
             net.prepareHandler = { [weak cam] in
                 cam?.setROI(percent: 20)
-                cam?.lockAllAtCurrent()
-                cam?.setNeutralGains()
+                cam?.applyFixedCalibration(iso: Self.calibrationISO, shutter: Self.calibrationShutter)
             }
             // Chiamato sempre sul main thread da NetworkManager
             net.blackoutHandler = { [weak cam] on in
