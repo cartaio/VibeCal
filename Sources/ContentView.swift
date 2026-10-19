@@ -87,6 +87,8 @@ struct ContentView: View {
                             Text("Ultimo: \(net.lastMessage)")
                                 .font(.system(.footnote, design: .monospaced))
                                 .lineLimit(3)
+                            Text("Patch: \(net.currentPatch)")
+                                .font(.system(.footnote, design: .monospaced))
                         }
                     }
                     GroupBox("Lettura live") {
