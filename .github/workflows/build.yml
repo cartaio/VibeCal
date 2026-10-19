@@ -1,0 +1,48 @@
+name: Build iOS app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Show Xcode version and repo layout
+        run: |
+          xcodebuild -version
+          ls -la
+          ls -la Sources
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project VibeCal.xcodeproj \
+            -scheme VibeCal \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/VibeCal.app Payload/
+          zip -r VibeCal.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VibeCal-ipa
+          path: VibeCal.ipa

@@ -7,7 +7,7 @@ settings:
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1"
 targets:
-  DisplayCalib:
+  VibeCal:
     type: application
     platform: iOS
     sources:
@@ -15,14 +15,14 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Vibe Display Calib
+        CFBundleDisplayName: VibeCal
         NSCameraUsageDescription: "La fotocamera frontale misura il colore dello schermo del monitor."
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     settings:
       base:
-        # CAMBIALO con un identificatore unico tuo (es. dev.tuonome.displaycalib)
-        PRODUCT_BUNDLE_IDENTIFIER: dev.cartaio.VibeCal
+        # CAMBIALO con un identificatore unico tuo (es. dev.tuonome.vibecal)
+        PRODUCT_BUNDLE_IDENTIFIER: dev.example.vibecal
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"

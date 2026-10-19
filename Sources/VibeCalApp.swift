@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct DisplayCalibApp: App {
+struct VibeCalApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

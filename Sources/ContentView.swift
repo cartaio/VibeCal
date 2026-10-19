@@ -27,7 +27,7 @@ struct ContentView: View {
         ZStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Display Calib: test").font(.title2.bold())
+                    Text("VibeCal: test").font(.title2.bold())
 
                     GroupBox("Capacità della fotocamera frontale") {
                         Text(cam.capabilities)

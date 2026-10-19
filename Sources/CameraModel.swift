@@ -30,7 +30,7 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     // MARK: - Stato interno (toccato solo dalla coda `queue`, se non indicato)
     private let session = AVCaptureSession()
     private let output = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "displaycalib.camera")
+    private let queue = DispatchQueue(label: "vibecal.camera")
     private var device: AVCaptureDevice?
     private var roiFraction = 0.2
     private var history: [(Double, Double, Double)] = []
