@@ -3,6 +3,8 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var cam = CameraModel()
+    @StateObject private var net = NetworkManager()
+    @State private var pcIP = "192.168.1.50"
     @State private var roi = 20.0
     @State private var iso: Float = 100
     @State private var shutterIndex = 2
@@ -68,7 +70,25 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                         }
                     }
-
+                    GroupBox("Rete (mock)") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            TextField("IP del PC", text: $pcIP)
+                                .textFieldStyle(.roundedBorder)
+                                .keyboardType(.numbersAndPunctuation)
+                                .autocorrectionDisabled()
+                            HStack {
+                                Button("Connetti") { net.connect(to: pcIP) }
+                                    .buttonStyle(.borderedProminent)
+                                Button("Stop") { net.disconnect() }
+                                    .buttonStyle(.bordered)
+                            }
+                            Text("Stato: \(net.status)")
+                                .font(.system(.footnote, design: .monospaced))
+                            Text("Ultimo: \(net.lastMessage)")
+                                .font(.system(.footnote, design: .monospaced))
+                                .lineLimit(3)
+                        }
+                    }
                     GroupBox("Lettura live") {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 12) {
