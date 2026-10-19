@@ -1,10 +1,17 @@
 import Foundation
 import Combine
+import UIKit
 
 final class NetworkManager: ObservableObject {
     @Published var status: String = "inattivo"
     @Published var lastMessage: String = "-"
     @Published var currentPatch: String = "-"
+
+    // Wired by ContentView to the camera
+    var sampleProvider: (() -> [Double]?)?
+    var prepareHandler: (() -> Void)?
+    var finishHandler: (() -> Void)?
+    var blackoutHandler: ((Bool) -> Void)?
 
     private var task: URLSessionWebSocketTask?
 
@@ -14,13 +21,11 @@ final class NetworkManager: ObservableObject {
         guard let url = URL(string: "ws://\(trimmed):\(port)") else {
             status = "URL non valido: \(trimmed)"; return
         }
-
         task?.cancel()
         let newTask = URLSession.shared.webSocketTask(with: url)
         task = newTask
         newTask.resume()
         status = "connessione a \(trimmed):\(port)…"
-
         send(["type": "handshake", "device": "iPhone"])
         receive()
     }
@@ -28,6 +33,7 @@ final class NetworkManager: ObservableObject {
     func disconnect() {
         task?.cancel()
         task = nil
+        blackoutHandler?(false)
         status = "disconnesso"
         currentPatch = "-"
     }
@@ -50,6 +56,7 @@ final class NetworkManager: ObservableObject {
             case .failure(let err):
                 self.status = "disconnesso: \(err.localizedDescription)"
                 self.currentPatch = "-"
+                self.blackoutHandler?(false)
             case .success(let msg):
                 var text = ""
                 switch msg {
@@ -62,25 +69,50 @@ final class NetworkManager: ObservableObject {
             }
         }
     }
-
+    private func runCountdown(_ remaining: Int) {
+        guard task != nil else { return }   // aborted via Stop
+        if remaining <= 0 {
+            status = "attendo prepare…"
+            return
+        }
+        status = "posiziona il telefono… \(remaining)"
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runCountdown(remaining - 1)
+        }
+    }
     private func handle(text: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let command = obj["command"] as? String else {
-            status = "msg non riconosciuto"
-            return
+            status = "msg non riconosciuto"; return
         }
+        let settleMs = (obj["settle_ms"] as? Double) ?? 1000.0
 
         switch command {
+        case "countdown":
+            let seconds = Int(obj["seconds"] as? Double ?? 15)
+            runCountdown(seconds)    
+        case "prepare":
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            status = "preparazione: blocco AE/WB…"
+            blackoutHandler?(true)
+            prepareHandler?()
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
+                self?.send(["type": "ready"])
+                self?.status = "pronto, in attesa delle patch"
+            }
         case "display_patch":
             let patchId = obj["patch_id"] as? String ?? "?"
-            let settleMs = (obj["settle_ms"] as? Double) ?? 1000.0
             currentPatch = patchId
             status = "misuro \(patchId)…"
             DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
-                self?.sendMockReading(patchId: patchId)
+                self?.startSampling(patchId: patchId, frames: 8, intervalMs: 80)
             }
-        case "session_end":
+        case "finish":
+            UINotificationFeedbackGenerator().notificationOccurred(.success)        
+            blackoutHandler?(false)
+            finishHandler?()
             status = "sessione completata ✅"
             currentPatch = "-"
         default:
@@ -88,8 +120,23 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    private func sendMockReading(patchId: String) {
-        // MOCK — next step: replace with real CameraModel ROI average
-        send(["type": "reading", "patch_id": patchId, "raw_data": [4095, 120, 95]])
+    private func startSampling(patchId: String, frames: Int, intervalMs: Double) {
+        var samples: [[Double]] = []
+        func step() {
+            if let s = self.sampleProvider?(), s.count >= 3 { samples.append(s) }
+            if samples.count < frames {
+                DispatchQueue.main.asyncAfter(deadline: .now() + intervalMs / 1000.0, execute: step)
+            } else {
+                let n = Double(samples.count)
+                var sum = [0.0, 0.0, 0.0]
+                for s in samples { sum[0] += s[0]; sum[1] += s[1]; sum[2] += s[2] }
+                let avg = sum.map { $0 / n }
+                let sigma = samples.last?.count ?? 0 > 3 ? samples[frames - 1][3] : -1.0
+                self.send(["type": "reading", "patch_id": patchId,
+                           "raw_data": avg, "sigma": sigma, "frames": samples.count])
+                self.status = "misurato \(patchId)"
+            }
+        }
+        step()
     }
 }

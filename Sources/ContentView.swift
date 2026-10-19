@@ -5,6 +5,7 @@ struct ContentView: View {
     @StateObject private var cam = CameraModel()
     @StateObject private var net = NetworkManager()
     @State private var pcIP = "192.168.1.50"
+    @State private var savedBrightness: CGFloat = 0.5
     @State private var roi = 20.0
     @State private var iso: Float = 100
     @State private var shutterIndex = 2
@@ -172,6 +173,29 @@ struct ContentView: View {
             }
         }
         .statusBarHidden(cam.blackout)
-        .onAppear { cam.start() }
+        .onAppear {
+            cam.start()
+            net.sampleProvider = { [weak cam] in
+                guard let cam = cam else { return nil }
+                return [cam.liveR, cam.liveG, cam.liveB, cam.liveSigma]
+            }
+            net.prepareHandler = { [weak cam] in
+                cam?.setROI(percent: 20)
+                cam?.lockAllAtCurrent()
+                cam?.setNeutralGains()
+            }
+            net.blackoutHandler = { [weak cam] on in
+                cam?.blackout = on
+                if on {
+                    savedBrightness = UIScreen.main.brightness
+                    UIScreen.main.brightness = 0.02
+                } else {
+                    UIScreen.main.brightness = savedBrightness
+                }
+            }
+            net.finishHandler = { [weak cam] in
+                cam?.unlockAll()
+            }
+        }
     }
 }
