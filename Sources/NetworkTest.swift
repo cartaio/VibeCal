@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 class NetworkManager: ObservableObject {
     private var task: URLSessionWebSocketTask?
