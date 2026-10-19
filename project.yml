@@ -1,4 +1,4 @@
-name: DisplayCalib
+name: VibeCal
 options:
   deploymentTarget:
     iOS: "17.0"
@@ -15,7 +15,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Display Calib
+        CFBundleDisplayName: Vibe Display Calib
         NSCameraUsageDescription: "La fotocamera frontale misura il colore dello schermo del monitor."
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -23,6 +23,6 @@ targets:
     settings:
       base:
         # CAMBIALO con un identificatore unico tuo (es. dev.tuonome.displaycalib)
-        PRODUCT_BUNDLE_IDENTIFIER: dev.example.displaycalib
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cartaio.VibeCal
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
