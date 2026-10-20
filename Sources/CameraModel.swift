@@ -36,6 +36,10 @@ struct BurstResult {
     var elapsedMs = 0.0
     var timedOut = false
     var error: String?
+    var discarded = 0                    // frame scartati in più perché l'EXIF non mostrava ancora l'esposizione richiesta
+    var exifShutter = -1.0               // esposizione dichiarata dai frame misurati (-1 = EXIF non disponibile)
+    var exifISO = -1.0
+    var exifMatch = true                 // false se i frame misurati dichiarano un'esposizione diversa da quella applicata
 
     /// Dizionario compatibile con JSONSerialization (niente NaN/inf).
     func json(id: String) -> [String: Any] {
@@ -56,7 +60,11 @@ struct BurstResult {
             "exposure_stable": stable,
             "roi_percent": f(roiPercent),
             "elapsed_ms": f(elapsedMs),
-            "timed_out": timedOut
+            "timed_out": timedOut,
+            "discarded": discarded,
+            "exif_shutter_s": f(exifShutter),
+            "exif_iso": f(exifISO),
+            "exif_match": exifMatch
         ]
         if let e = error { d["error"] = e }
         return d
@@ -95,8 +103,12 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         var r: Double, g: Double, b: Double
         var hi: [Double]      // frazione di pixel saturi per canale
         var lo: [Double]      // frazione di pixel a zero per canale
+        var shutter: Double   // esposizione dichiarata nell'EXIF del frame (-1 se assente)
+        var iso: Double
     }
     private var burst: [FrameSample]?
+    private var burstApplied = (iso: Float(0), shutter: 0.0)   // esposizione realmente applicata (riletta dalla camera)
+    private var burstExtra = 0                                  // frame scartati per EXIF non corrispondente
     private var burstSkip = 0
     private var burstTarget = 0
     private var burstToken = 0
@@ -380,11 +392,22 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private func beginBurst(token: Int) {
         guard token == burstToken, burst == nil, burstCompletion != nil, let d = device else { return }
         burstStart = (d.iso, d.exposureDuration.seconds)
+        burstApplied = burstStart
+        burstExtra = 0
         burst = []
     }
 
     private func handleBurstFrame(_ s: FrameSample) {
         if burstSkip > 0 { burstSkip -= 1; return }
+        // Se il frame dichiara nell'EXIF un'esposizione diversa da quella applicata è un frame
+        // "in ritardo" della pipeline: scartalo (al massimo 20 frame, poi procedi e segnalalo).
+        if s.shutter > 0, burstApplied.shutter > 0 {
+            let off = abs(s.shutter - burstApplied.shutter) / burstApplied.shutter
+            if off > 0.08 && burstExtra < 20 {
+                burstExtra += 1
+                return
+            }
+        }
         burst?.append(s)
         if (burst?.count ?? 0) >= burstTarget { completeBurst(timedOut: false) }
     }
@@ -427,7 +450,20 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             res.sigma = ((vR + vG + vB) / 3.0).squareRoot()
             res.clipHigh = hi.map { $0 / n }
             res.clipLow = lo.map { $0 / n }
+
+            // Esposizione dichiarata dai frame misurati (EXIF)
+            let withExif = samples.filter { $0.shutter > 0 }
+            if !withExif.isEmpty {
+                let k = Double(withExif.count)
+                res.exifShutter = withExif.reduce(0.0) { $0 + $1.shutter } / k
+                let isos = withExif.filter { $0.iso > 0 }
+                if !isos.isEmpty { res.exifISO = isos.reduce(0.0) { $0 + $1.iso } / Double(isos.count) }
+                if burstApplied.shutter > 0 {
+                    res.exifMatch = abs(res.exifShutter - burstApplied.shutter) / burstApplied.shutter < 0.08
+                }
+            }
         }
+        res.discarded = burstExtra
 
         if let d = device {
             res.iso = d.iso
@@ -531,9 +567,11 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         collecting?.append(sample)
 
         if burst != nil {
+            let ex = Self.frameExposure(sampleBuffer)
             handleBurstFrame(FrameSample(r: sample.0, g: sample.1, b: sample.2,
                                          hi: [Double(hr) / dn, Double(hg) / dn, Double(hb) / dn],
-                                         lo: [Double(lr) / dn, Double(lg) / dn, Double(lb) / dn]))
+                                         lo: [Double(lr) / dn, Double(lg) / dn, Double(lb) / dn],
+                                         shutter: ex.shutter, iso: ex.iso))
         }
 
         frameCount += 1
@@ -546,6 +584,17 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                 self.liveSigma = s.3
             }
         }
+    }
+
+    /// Esposizione dichiarata nei metadati (EXIF) del frame; (-1, -1) se non disponibile.
+    private static func frameExposure(_ sb: CMSampleBuffer) -> (shutter: Double, iso: Double) {
+        guard let dict = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault, target: sb,
+                                                       attachmentMode: kCMAttachmentMode_ShouldPropagate) as? [String: Any],
+              let exif = dict["{Exif}"] as? [String: Any] else { return (-1, -1) }
+        let t = (exif["ExposureTime"] as? NSNumber)?.doubleValue ?? -1
+        var iso = -1.0
+        if let arr = exif["ISOSpeedRatings"] as? [NSNumber], let first = arr.first { iso = first.doubleValue }
+        return (t, iso)
     }
 
     private static func stats(_ h: [(Double, Double, Double)]) -> (Double, Double, Double, Double) {

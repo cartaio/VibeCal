@@ -2,6 +2,16 @@ import Foundation
 import Combine
 import UIKit
 
+/// Piano di misura di una singola patch (di solito arriva dal server dentro "display_patch").
+struct PatchPlan {
+    var exposures: [ExposureSpec]
+    var frames: Int
+    var discard: Int
+    /// Se impostato, la scala di esposizioni si ferma dopo il primo scatto in cui
+    /// il canale più alto raggiunge questo valore (le esposizioni più lunghe sarebbero saturate).
+    var stopAbove: Double?
+}
+
 final class NetworkManager: ObservableObject {
     @Published var status: String = "inattivo"
     @Published var lastMessage: String = "-"
@@ -19,7 +29,7 @@ final class NetworkManager: ObservableObject {
 
     private var task: URLSessionWebSocketTask?
     private var generation = 0                 // si incrementa a ogni connect/disconnect: invalida le misure in corso
-    private var exposures: [ExposureSpec] = [] // ricevute dal server nel comando "prepare"
+    private var exposures: [ExposureSpec] = [] // piano di default (comando "prepare"), usato se display_patch non ne porta uno
     private var burstFrames = 8
     private var discardFrames = 3
 
@@ -123,7 +133,7 @@ final class NetworkManager: ObservableObject {
         case "prepare":
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             status = "preparazione: esposizione fissa…"
-            parseExposures(obj)
+            parseDefaults(obj)
             blackoutHandler?(true)
             prepareHandler?()
             DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
@@ -134,9 +144,10 @@ final class NetworkManager: ObservableObject {
             let patchId = obj["patch_id"] as? String ?? "?"
             currentPatch = patchId
             status = "misuro \(patchId)…"
+            let plan = makePlan(obj)
             let gen = generation
             DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
-                self?.measurePatch(patchId: patchId, gen: gen)
+                self?.measurePatch(patchId: patchId, plan: plan, gen: gen)
             }
         case "finish":
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -150,58 +161,76 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    // MARK: - Esposizioni multiple
+    // MARK: - Piano di misura
 
-    private func parseExposures(_ obj: [String: Any]) {
-        exposures = []
-        if let list = obj["exposures"] as? [[String: Any]] {
-            for (i, e) in list.enumerated() {
-                guard let iso = number(e["iso"]), let shutter = number(e["shutter_s"]), shutter > 0 else { continue }
-                exposures.append(ExposureSpec(id: e["id"] as? String ?? "e\(i)",
-                                              iso: Float(iso), shutter: shutter))
-            }
+    private func exposureList(_ any: Any?) -> [ExposureSpec] {
+        var out: [ExposureSpec] = []
+        guard let list = any as? [[String: Any]] else { return out }
+        for (i, e) in list.enumerated() {
+            guard let iso = number(e["iso"]), let shutter = number(e["shutter_s"]), shutter > 0 else { continue }
+            out.append(ExposureSpec(id: e["id"] as? String ?? "e\(i)", iso: Float(iso), shutter: shutter))
         }
+        return out
+    }
+
+    /// Valori di default (da "prepare"): usati solo se una patch non porta un piano proprio.
+    private func parseDefaults(_ obj: [String: Any]) {
+        exposures = exposureList(obj["exposures"])
         if let n = number(obj["burst_frames"]) { burstFrames = max(1, Int(n)) }
         if let n = number(obj["discard_frames"]) { discardFrames = max(0, Int(n)) }
     }
 
-    private func measurePatch(patchId: String, gen: Int) {
+    private func makePlan(_ obj: [String: Any]) -> PatchPlan {
+        let own = exposureList(obj["exposures"])
+        return PatchPlan(exposures: own.isEmpty ? exposures : own,
+                         frames: number(obj["burst_frames"]).map { max(1, Int($0)) } ?? burstFrames,
+                         discard: number(obj["discard_frames"]).map { max(0, Int($0)) } ?? discardFrames,
+                         stopAbove: number(obj["stop_above"]))
+    }
+
+    private func measurePatch(patchId: String, plan: PatchPlan, gen: Int) {
         guard gen == generation, task != nil else { return }   // Stop/disconnessione: abbandona
-        if burstProvider != nil && !exposures.isEmpty {
-            runShots(patchId: patchId, index: 0, shots: [], startedAt: Date(), gen: gen)
+        if burstProvider != nil && !plan.exposures.isEmpty {
+            runShots(patchId: patchId, plan: plan, index: 0, shots: [], startedAt: Date(), gen: gen)
         } else {
             startSampling(patchId: patchId, frames: 8, intervalMs: 80)   // vecchio comportamento
         }
     }
 
     /// Una raffica per esposizione, in sequenza; alla fine un solo pacchetto "reading".
-    private func runShots(patchId: String, index: Int, shots: [[String: Any]],
+    private func runShots(patchId: String, plan: PatchPlan, index: Int, shots: [[String: Any]],
                           startedAt: Date, gen: Int) {
         guard gen == generation, task != nil else { return }
-        guard index < exposures.count, let burst = burstProvider else {
-            sendReading(patchId: patchId, shots: shots, startedAt: startedAt)
+        guard index < plan.exposures.count, let burst = burstProvider else {
+            sendReading(patchId: patchId, plan: plan, shots: shots, startedAt: startedAt)
             return
         }
-        let spec = exposures[index]
-        status = "misuro \(patchId) [\(spec.id)] \(index + 1)/\(exposures.count)…"
-        burst(spec, discardFrames, burstFrames) { [weak self] result in
+        let spec = plan.exposures[index]
+        status = "misuro \(patchId) [\(spec.id)] \(index + 1)/\(plan.exposures.count)…"
+        burst(spec, plan.discard, plan.frames) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 var acc = shots
                 acc.append(result.json(id: spec.id))
-                self.runShots(patchId: patchId, index: index + 1, shots: acc,
+                // Scala crescente: se il canale più alto è già al limite, le esposizioni più lunghe sono inutili
+                var next = index + 1
+                if let limit = plan.stopAbove, (result.mean.max() ?? 0) >= limit {
+                    next = plan.exposures.count
+                }
+                self.runShots(patchId: patchId, plan: plan, index: next, shots: acc,
                               startedAt: startedAt, gen: gen)
             }
         }
     }
 
-    private func sendReading(patchId: String, shots: [[String: Any]], startedAt: Date) {
+    private func sendReading(patchId: String, plan: PatchPlan, shots: [[String: Any]], startedAt: Date) {
         var packet: [String: Any] = [
             "type": "reading",
             "patch_id": patchId,
             "shots": shots,
-            "frames_per_shot": burstFrames,
-            "discard_frames": discardFrames,
+            "frames_per_shot": plan.frames,
+            "discard_frames": plan.discard,
+            "planned_shots": plan.exposures.count,
             "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
             "phone_time": ISO8601DateFormatter().string(from: Date()),
             "measure_ms": Date().timeIntervalSince(startedAt) * 1000.0
@@ -214,7 +243,7 @@ final class NetworkManager: ObservableObject {
             packet["frames"] = frames
         }
         send(packet)
-        status = "misurato \(patchId) (\(shots.count) esposizioni)"
+        status = "misurato \(patchId) (\(shots.count)/\(plan.exposures.count) esposizioni)"
     }
 
     // MARK: - Vecchio campionamento (usato solo se il server non manda "exposures")
