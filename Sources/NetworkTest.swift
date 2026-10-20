@@ -12,8 +12,16 @@ final class NetworkManager: ObservableObject {
     var prepareHandler: (() -> Void)?
     var finishHandler: (() -> Void)?
     var blackoutHandler: ((Bool) -> Void)?
+    /// Raffica a esposizione fissa: (esposizione, frame da scartare, frame da misurare, completion)
+    var burstProvider: ((ExposureSpec, Int, Int, @escaping (BurstResult) -> Void) -> Void)?
+    /// Info sul dispositivo/camera da mandare nell'handshake
+    var infoProvider: (() -> [String: Any])?
 
     private var task: URLSessionWebSocketTask?
+    private var generation = 0                 // si incrementa a ogni connect/disconnect: invalida le misure in corso
+    private var exposures: [ExposureSpec] = [] // ricevute dal server nel comando "prepare"
+    private var burstFrames = 8
+    private var discardFrames = 3
 
     func connect(to ip: String, port: Int = 8765) {
         let trimmed = ip.trimmingCharacters(in: .whitespaces)
@@ -22,17 +30,21 @@ final class NetworkManager: ObservableObject {
             status = "URL non valido: \(trimmed)"; return
         }
         task?.cancel()
+        generation += 1
         let newTask = URLSession.shared.webSocketTask(with: url)
         task = newTask
         newTask.resume()
         status = "connessione a \(trimmed):\(port)…"
-        send(["type": "handshake", "device": "iPhone"])
+        var handshake: [String: Any] = ["type": "handshake", "device": "iPhone"]
+        if let info = infoProvider?(), !info.isEmpty { handshake["info"] = info }
+        send(handshake)
         receive(on: newTask)
     }
 
     func disconnect() {
         task?.cancel()
         task = nil
+        generation += 1
         blackoutHandler?(false)
         status = "disconnesso"
         currentPatch = "-"
@@ -62,6 +74,7 @@ final class NetworkManager: ObservableObject {
                 guard self.task === socket else { return }
                 switch result {
                 case .failure(let err):
+                    self.generation += 1
                     self.status = "disconnesso: \(err.localizedDescription)"
                     self.currentPatch = "-"
                     self.blackoutHandler?(false)
@@ -79,6 +92,7 @@ final class NetworkManager: ObservableObject {
             }
         }
     }
+
     private func runCountdown(_ remaining: Int) {
         guard task != nil else { return }   // aborted via Stop
         if remaining <= 0 {
@@ -91,21 +105,25 @@ final class NetworkManager: ObservableObject {
             self?.runCountdown(remaining - 1)
         }
     }
+
+    private func number(_ v: Any?) -> Double? { (v as? NSNumber)?.doubleValue }
+
     private func handle(text: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let command = obj["command"] as? String else {
             status = "msg non riconosciuto"; return
         }
-        let settleMs = (obj["settle_ms"] as? Double) ?? 1000.0
+        let settleMs = number(obj["settle_ms"]) ?? 1000.0
 
         switch command {
         case "countdown":
-            let seconds = Int(obj["seconds"] as? Double ?? 15)
-            runCountdown(seconds)    
+            let seconds = Int(number(obj["seconds"]) ?? 15)
+            runCountdown(seconds)
         case "prepare":
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            status = "preparazione: blocco AE/WB…"
+            status = "preparazione: esposizione fissa…"
+            parseExposures(obj)
             blackoutHandler?(true)
             prepareHandler?()
             DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
@@ -116,11 +134,13 @@ final class NetworkManager: ObservableObject {
             let patchId = obj["patch_id"] as? String ?? "?"
             currentPatch = patchId
             status = "misuro \(patchId)…"
+            let gen = generation
             DispatchQueue.main.asyncAfter(deadline: .now() + settleMs / 1000.0) { [weak self] in
-                self?.startSampling(patchId: patchId, frames: 8, intervalMs: 80)
+                self?.measurePatch(patchId: patchId, gen: gen)
             }
         case "finish":
-            UINotificationFeedbackGenerator().notificationOccurred(.success)        
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            generation += 1
             blackoutHandler?(false)
             finishHandler?()
             status = "sessione completata ✅"
@@ -129,6 +149,75 @@ final class NetworkManager: ObservableObject {
             status = "comando ignoto: \(command)"
         }
     }
+
+    // MARK: - Esposizioni multiple
+
+    private func parseExposures(_ obj: [String: Any]) {
+        exposures = []
+        if let list = obj["exposures"] as? [[String: Any]] {
+            for (i, e) in list.enumerated() {
+                guard let iso = number(e["iso"]), let shutter = number(e["shutter_s"]), shutter > 0 else { continue }
+                exposures.append(ExposureSpec(id: e["id"] as? String ?? "e\(i)",
+                                              iso: Float(iso), shutter: shutter))
+            }
+        }
+        if let n = number(obj["burst_frames"]) { burstFrames = max(1, Int(n)) }
+        if let n = number(obj["discard_frames"]) { discardFrames = max(0, Int(n)) }
+    }
+
+    private func measurePatch(patchId: String, gen: Int) {
+        guard gen == generation, task != nil else { return }   // Stop/disconnessione: abbandona
+        if burstProvider != nil && !exposures.isEmpty {
+            runShots(patchId: patchId, index: 0, shots: [], startedAt: Date(), gen: gen)
+        } else {
+            startSampling(patchId: patchId, frames: 8, intervalMs: 80)   // vecchio comportamento
+        }
+    }
+
+    /// Una raffica per esposizione, in sequenza; alla fine un solo pacchetto "reading".
+    private func runShots(patchId: String, index: Int, shots: [[String: Any]],
+                          startedAt: Date, gen: Int) {
+        guard gen == generation, task != nil else { return }
+        guard index < exposures.count, let burst = burstProvider else {
+            sendReading(patchId: patchId, shots: shots, startedAt: startedAt)
+            return
+        }
+        let spec = exposures[index]
+        status = "misuro \(patchId) [\(spec.id)] \(index + 1)/\(exposures.count)…"
+        burst(spec, discardFrames, burstFrames) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                var acc = shots
+                acc.append(result.json(id: spec.id))
+                self.runShots(patchId: patchId, index: index + 1, shots: acc,
+                              startedAt: startedAt, gen: gen)
+            }
+        }
+    }
+
+    private func sendReading(patchId: String, shots: [[String: Any]], startedAt: Date) {
+        var packet: [String: Any] = [
+            "type": "reading",
+            "patch_id": patchId,
+            "shots": shots,
+            "frames_per_shot": burstFrames,
+            "discard_frames": discardFrames,
+            "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            "phone_time": ISO8601DateFormatter().string(from: Date()),
+            "measure_ms": Date().timeIntervalSince(startedAt) * 1000.0
+        ]
+        // Compatibilità col vecchio formato: valori della prima esposizione
+        if let first = shots.first, let mean = first["mean"],
+           let sigma = first["sigma"], let frames = first["frames"] {
+            packet["raw_data"] = mean
+            packet["sigma"] = sigma
+            packet["frames"] = frames
+        }
+        send(packet)
+        status = "misurato \(patchId) (\(shots.count) esposizioni)"
+    }
+
+    // MARK: - Vecchio campionamento (usato solo se il server non manda "exposures")
 
     private func startSampling(patchId: String, frames: Int, intervalMs: Double) {
         var samples: [[Double]] = []

@@ -11,6 +11,58 @@ struct Reading: Identifiable {
     let sigma: Double
 }
 
+/// Esposizione fissa richiesta dal server (ISO + tempo di otturazione).
+struct ExposureSpec {
+    let id: String
+    let iso: Float
+    let shutter: Double      // secondi
+}
+
+/// Risultato di una raffica di frame a esposizione fissa.
+struct BurstResult {
+    var mean: [Double] = [0, 0, 0]       // R, G, B (0-255), media sui frame
+    var std: [Double] = [0, 0, 0]        // deviazione standard temporale per canale
+    var sigma = 0.0                      // RMS delle tre deviazioni (come nella vecchia versione)
+    var frames = 0
+    var clipHigh: [Double] = [0, 0, 0]   // frazione di pixel della ROI con canale >= 250
+    var clipLow: [Double] = [0, 0, 0]    // frazione di pixel della ROI con canale <= 2
+    var reqISO: Float = 0
+    var reqShutter = 0.0
+    var iso: Float = 0                   // valori reali riletti dalla camera a fine raffica
+    var shutter = 0.0
+    var gains: [Double] = [1, 1, 1]
+    var stable = true                    // false se ISO/otturatore sono cambiati durante la raffica
+    var roiPercent = 0.0
+    var elapsedMs = 0.0
+    var timedOut = false
+    var error: String?
+
+    /// Dizionario compatibile con JSONSerialization (niente NaN/inf).
+    func json(id: String) -> [String: Any] {
+        func f(_ x: Double) -> Double { x.isFinite ? x : -1 }
+        var d: [String: Any] = [
+            "id": id,
+            "req_iso": f(Double(reqISO)),
+            "req_shutter_s": f(reqShutter),
+            "iso": f(Double(iso)),
+            "shutter_s": f(shutter),
+            "gains": gains.map(f),
+            "mean": mean.map(f),
+            "std": std.map(f),
+            "sigma": f(sigma),
+            "frames": frames,
+            "clip_high": clipHigh.map(f),
+            "clip_low": clipLow.map(f),
+            "exposure_stable": stable,
+            "roi_percent": f(roiPercent),
+            "elapsed_ms": f(elapsedMs),
+            "timed_out": timedOut
+        ]
+        if let e = error { d["error"] = e }
+        return d
+    }
+}
+
 final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     // MARK: - Stato mostrato nella UI (sempre aggiornato sul main thread)
@@ -37,6 +89,21 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var collecting: [(Double, Double, Double)]?
     private var frameCount = 0
     private var savedBrightness: CGFloat = 0.5   // solo main thread
+
+    // Raffica a esposizione fissa (tutto toccato solo dalla coda `queue`)
+    private struct FrameSample {
+        var r: Double, g: Double, b: Double
+        var hi: [Double]      // frazione di pixel saturi per canale
+        var lo: [Double]      // frazione di pixel a zero per canale
+    }
+    private var burst: [FrameSample]?
+    private var burstSkip = 0
+    private var burstTarget = 0
+    private var burstToken = 0
+    private var burstCompletion: ((BurstResult) -> Void)?
+    private var burstReq = (iso: Float(0), shutter: 0.0)
+    private var burstStart = (iso: Float(0), shutter: 0.0)
+    private var burstRequestedAt = Date()
 
     // MARK: - Avvio
     func start() {
@@ -259,6 +326,160 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         queue.async { self.roiFraction = max(0.05, min(1.0, percent / 100.0)) }
     }
 
+    // MARK: - Raffica a esposizione fissa
+    /// Imposta ISO e otturatore manuali, scarta `discard` frame (l'esposizione impiega qualche frame
+    /// ad assestarsi), poi raccoglie `frames` frame e restituisce le statistiche.
+    /// `completion` viene chiamata sulla coda della camera (NON sul main thread).
+    func captureBurst(spec: ExposureSpec, discard: Int, frames: Int,
+                      completion: @escaping (BurstResult) -> Void) {
+        queue.async {
+            func fail(_ msg: String) {
+                var r = BurstResult()
+                r.reqISO = spec.iso
+                r.reqShutter = spec.shutter
+                r.error = msg
+                completion(r)
+            }
+            guard let d = self.device else { return fail("camera non disponibile") }
+            guard d.isExposureModeSupported(.custom) else { return fail("esposizione manuale non supportata") }
+            guard self.burstCompletion == nil else { return fail("raffica già in corso") }
+
+            let f = d.activeFormat
+            let iso = min(max(spec.iso, f.minISO), f.maxISO)
+            let lo = f.minExposureDuration.seconds
+            let hi = f.maxExposureDuration.seconds
+            let t = CMTime(seconds: min(max(spec.shutter, lo), hi), preferredTimescale: 1_000_000)
+
+            self.burstToken &+= 1
+            let token = self.burstToken
+            self.burst = nil
+            self.burstReq = (spec.iso, spec.shutter)
+            self.burstCompletion = completion
+            self.burstSkip = max(0, discard)
+            self.burstTarget = max(1, frames)
+            self.burstRequestedAt = Date()
+
+            do {
+                try d.lockForConfiguration()
+                d.setExposureModeCustom(duration: t, iso: iso) { [weak self] _ in
+                    self?.queue.async { self?.beginBurst(token: token) }
+                }
+                d.unlockForConfiguration()
+            } catch {
+                self.burstCompletion = nil
+                return fail("lockForConfiguration: \(error.localizedDescription)")
+            }
+            // Reti di sicurezza: se il completion handler non arriva parti comunque, poi timeout
+            self.queue.asyncAfter(deadline: .now() + 1.5) { self.beginBurst(token: token) }
+            self.queue.asyncAfter(deadline: .now() + 8.0) {
+                if self.burstToken == token { self.completeBurst(timedOut: true) }
+            }
+        }
+    }
+
+    private func beginBurst(token: Int) {
+        guard token == burstToken, burst == nil, burstCompletion != nil, let d = device else { return }
+        burstStart = (d.iso, d.exposureDuration.seconds)
+        burst = []
+    }
+
+    private func handleBurstFrame(_ s: FrameSample) {
+        if burstSkip > 0 { burstSkip -= 1; return }
+        burst?.append(s)
+        if (burst?.count ?? 0) >= burstTarget { completeBurst(timedOut: false) }
+    }
+
+    private func completeBurst(timedOut: Bool) {
+        guard let done = burstCompletion else { return }
+        let samples = burst ?? []
+        burst = nil
+        burstCompletion = nil
+        burstToken &+= 1
+
+        var res = BurstResult()
+        res.reqISO = burstReq.iso
+        res.reqShutter = burstReq.shutter
+        res.frames = samples.count
+        res.timedOut = timedOut
+        res.roiPercent = roiFraction * 100
+        res.elapsedMs = Date().timeIntervalSince(burstRequestedAt) * 1000
+
+        if samples.isEmpty {
+            res.error = "nessun frame letto"
+        } else {
+            let n = Double(samples.count)
+            var sumR = 0.0, sumG = 0.0, sumB = 0.0
+            var hi = [0.0, 0.0, 0.0], lo = [0.0, 0.0, 0.0]
+            for s in samples {
+                sumR += s.r; sumG += s.g; sumB += s.b
+                for c in 0..<3 { hi[c] += s.hi[c]; lo[c] += s.lo[c] }
+            }
+            let mR = sumR / n, mG = sumG / n, mB = sumB / n
+            var vR = 0.0, vG = 0.0, vB = 0.0
+            for s in samples {
+                vR += (s.r - mR) * (s.r - mR)
+                vG += (s.g - mG) * (s.g - mG)
+                vB += (s.b - mB) * (s.b - mB)
+            }
+            vR /= n; vG /= n; vB /= n
+            res.mean = [mR, mG, mB]
+            res.std = [vR.squareRoot(), vG.squareRoot(), vB.squareRoot()]
+            res.sigma = ((vR + vG + vB) / 3.0).squareRoot()
+            res.clipHigh = hi.map { $0 / n }
+            res.clipLow = lo.map { $0 / n }
+        }
+
+        if let d = device {
+            res.iso = d.iso
+            res.shutter = d.exposureDuration.seconds
+            let g = d.deviceWhiteBalanceGains
+            res.gains = [Double(g.redGain), Double(g.greenGain), Double(g.blueGain)]
+            let isoOK = abs(res.iso - burstStart.iso) < 0.5
+            let shutterOK = burstStart.shutter <= 0
+                || abs(res.shutter - burstStart.shutter) / burstStart.shutter < 0.02
+            res.stable = isoOK && shutterOK
+        }
+        done(res)
+    }
+
+    // MARK: - Info dispositivo (per l'handshake). Da chiamare solo dal main thread.
+    func deviceInfo() -> [String: Any] {
+        var info: [String: Any] = [
+            "model": Self.modelIdentifier(),
+            "os": UIDevice.current.systemVersion,
+            "app_version": (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?",
+            "thermal_state": ProcessInfo.processInfo.thermalState.rawValue
+        ]
+        queue.sync {
+            guard let d = self.device else { return }
+            let f = d.activeFormat
+            let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            info["camera"] = d.localizedName
+            info["format"] = "\(dims.width)x\(dims.height)"
+            info["min_iso"] = Double(f.minISO)
+            info["max_iso"] = Double(f.maxISO)
+            info["min_exposure_s"] = f.minExposureDuration.seconds
+            info["max_exposure_s"] = f.maxExposureDuration.seconds
+            info["max_wb_gain"] = Double(d.maxWhiteBalanceGain)
+            info["custom_exposure"] = d.isExposureModeSupported(.custom)
+            info["custom_wb_gains"] = d.isLockingWhiteBalanceWithCustomDeviceGainsSupported
+            info["min_frame_duration_s"] = d.activeVideoMinFrameDuration.seconds
+        }
+        // JSON non accetta NaN/inf (es. CMTime non valido)
+        for (k, v) in info {
+            if let x = v as? Double, !x.isFinite { info[k] = nil }
+        }
+        return info
+    }
+
+    private static func modelIdentifier() -> String {
+        var sys = utsname()
+        uname(&sys)
+        return withUnsafePointer(to: &sys.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+    }
+
     // MARK: - Lettura dei frame
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
@@ -279,25 +500,41 @@ final class CameraModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let ptr = base.assumingMemoryBound(to: UInt8.self)
 
         var sr = 0, sg = 0, sb = 0, n = 0
+        var hr = 0, hg = 0, hb = 0      // pixel saturi (>= 250) per canale
+        var lr = 0, lg = 0, lb = 0      // pixel a zero (<= 2) per canale
         var y = y0
         while y < y0 + rh {
             var x = x0
             while x < x0 + rw {
                 let p = ptr + y * bpr + x * 4      // formato BGRA
-                sb += Int(p[0])
-                sg += Int(p[1])
-                sr += Int(p[2])
+                let vb = Int(p[0]), vg = Int(p[1]), vr = Int(p[2])
+                sb += vb
+                sg += vg
+                sr += vr
+                if vr >= 250 { hr += 1 }
+                if vg >= 250 { hg += 1 }
+                if vb >= 250 { hb += 1 }
+                if vr <= 2 { lr += 1 }
+                if vg <= 2 { lg += 1 }
+                if vb <= 2 { lb += 1 }
                 n += 1
                 x += step
             }
             y += step
         }
         guard n > 0 else { return }
-        let sample = (Double(sr) / Double(n), Double(sg) / Double(n), Double(sb) / Double(n))
+        let dn = Double(n)
+        let sample = (Double(sr) / dn, Double(sg) / dn, Double(sb) / dn)
 
         history.append(sample)
         if history.count > 30 { history.removeFirst() }
         collecting?.append(sample)
+
+        if burst != nil {
+            handleBurstFrame(FrameSample(r: sample.0, g: sample.1, b: sample.2,
+                                         hi: [Double(hr) / dn, Double(hg) / dn, Double(hb) / dn],
+                                         lo: [Double(lr) / dn, Double(lg) / dn, Double(lb) / dn]))
+        }
 
         frameCount += 1
         if frameCount % 3 == 0 {

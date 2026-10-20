@@ -183,6 +183,18 @@ struct ContentView: View {
                 guard let cam = cam else { return nil }
                 return [cam.liveR, cam.liveG, cam.liveB, cam.liveSigma]
             }
+            net.burstProvider = { [weak cam] spec, discard, frames, done in
+                guard let cam = cam else {
+                    var r = BurstResult()
+                    r.error = "camera non disponibile"
+                    done(r)
+                    return
+                }
+                cam.captureBurst(spec: spec, discard: discard, frames: frames, completion: done)
+            }
+            net.infoProvider = { [weak cam] in
+                cam?.deviceInfo() ?? [:]
+            }
             net.prepareHandler = { [weak cam] in
                 cam?.setROI(percent: 20)
                 cam?.applyFixedCalibration(iso: Self.calibrationISO, shutter: Self.calibrationShutter)
